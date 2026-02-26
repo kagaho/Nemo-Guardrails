@@ -1,0 +1,11 @@
+# Example: Block competitor discussions
+define user ask about competitors
+  "what about [competitor]"
+  "how does [competitor] compare"
+
+define bot refuse competitor discussion
+  "I can only discuss our own products.
+
+define flow
+  user ask about competitors
+  bot refuse competitor discussion

@@ -1,0 +1,13 @@
+models:
+  - type: openai
+    engine: openai
+    model: vllm_model
+    api_base: "http://triton-openai-adapter:9000/v1"
+    api_key: "not-needed"
+
+rails:
+  llm:
+    # Tell Guardrails which LLM to use by default
+    model: vllm_model
+
+

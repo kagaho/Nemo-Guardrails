@@ -1,0 +1,6 @@
+instructions:
+  - type: general
+    content: |
+      You are a helpful assistant.
+      Be concise.
+      Do not add filler like "Sure!".

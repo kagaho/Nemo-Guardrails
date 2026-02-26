@@ -1,0 +1,5 @@
+models:
+  - type: main
+    engine: openai
+    model: vllm_model
+    api_key: "not-needed"

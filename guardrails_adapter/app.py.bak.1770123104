@@ -1,0 +1,173 @@
+import os
+import time
+import json
+import re
+from typing import Any, Dict, List, Optional, Union
+
+import requests
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+TRITON_BASE = os.environ.get("TRITON_BASE", "http://172.17.0.2:8000").rstrip("/")
+TRITON_MODEL = os.environ.get("TRITON_MODEL", "vllm_model")
+
+# OpenAI-ish request models (minimal subset)
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatCompletionsRequest(BaseModel):
+    model: Optional[str] = None
+    messages: List[ChatMessage]
+    temperature: Optional[float] = 0.0
+    max_tokens: Optional[int] = 256
+    stream: Optional[bool] = False
+    stop: Optional[Union[str, List[str]]] = None  # <-- IMPORTANT
+
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    return {"ok": True, "triton_base": TRITON_BASE, "triton_model": TRITON_MODEL}
+
+@app.get("/v1/models")
+def list_models():
+    return {"object": "list", "data": [{"id": TRITON_MODEL, "object": "model"}]}
+
+def messages_to_prompt(messages: List[ChatMessage]) -> str:
+    # Keep deterministic, but avoid role prefixes that some models love to echo.
+    # We still keep structure because Guardrails relies on it.
+    lines: List[str] = []
+    for m in messages:
+        role = (m.role or "").strip().lower()
+        content = m.content or ""
+        if role == "system":
+            lines.append(content.strip())
+        elif role == "user":
+            lines.append(f"User: {content}")
+        elif role == "assistant":
+            lines.append(f"Assistant: {content}")
+        else:
+            lines.append(f"User: {content}")
+    lines.append("Assistant:")
+    return "\n".join(lines).strip() + "\n"
+
+def _as_stop_list(stop: Optional[Union[str, List[str]]]) -> Optional[List[str]]:
+    if stop is None:
+        return None
+    if isinstance(stop, str):
+        s = stop.strip()
+        return [s] if s else None
+    out = []
+    for x in stop:
+        if x is None:
+            continue
+        s = str(x).strip()
+        if s:
+            out.append(s)
+    return out or None
+
+def clean_output(text: str) -> str:
+    if not text:
+        return ""
+
+    t = text.replace("\x00", "").strip()
+
+    # 1) If the model emits "assistantfinal....", prefer the tail after it (most reliable for your case)
+    m = re.search(r"(?:assistantfinal)(.*)$", t, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        tail = (m.group(1) or "").strip()
+        # If it's glued like "assistantfinalOK", tail becomes "OK"
+        if tail:
+            return tail
+
+    # 2) If it echoed transcript, keep only after the last "Assistant:" block
+    for marker in ["\nAssistant:", "\nASSISTANT:", "Assistant:", "ASSISTANT:"]:
+        if marker in t:
+            t = t.split(marker)[-1].strip()
+
+    # 3) Drop obvious transcript / prompt-echo lines
+    lines = [ln.rstrip() for ln in t.splitlines()]
+    cleaned: List[str] = []
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith(("USER:", "User:", "SYSTEM:", "System:")):
+            continue
+        if s.startswith(("ASSISTANT:", "Assistant:")):
+            s = s.split(":", 1)[-1].strip()
+            if not s:
+                continue
+        cleaned.append(s)
+
+    out = "\n".join(cleaned).strip()
+    return out if out else t.strip()
+
+@app.post("/v1/chat/completions")
+def chat_completions(req: ChatCompletionsRequest) -> Dict[str, Any]:
+    if req.stream:
+        raise HTTPException(status_code=400, detail="stream=true not supported in this minimal adapter yet")
+
+    prompt = messages_to_prompt(req.messages)
+
+    stop_list = _as_stop_list(req.stop)
+
+    # Default stop sequences that prevent transcript re-entry (helps even if client doesn't provide stop)
+    default_stops = ["\nUser:", "\nUSER:", "\nSystem:", "\nSYSTEM:"]
+    if stop_list:
+        # Merge without duplicates while preserving order
+        merged = []
+        for s in stop_list + default_stops:
+            if s not in merged:
+                merged.append(s)
+        stop_list = merged
+    else:
+        stop_list = default_stops
+
+    sampling = {
+        "temperature": float(req.temperature if req.temperature is not None else 0.0),
+        "max_tokens": int(req.max_tokens if req.max_tokens is not None else 256),
+        "stop": stop_list,
+    }
+
+    # Triton vLLM backend tends to accept sampling_parameters as JSON string (this matches your earlier successful curls)
+    payload = {
+        "text_input": prompt,
+        "exclude_input_in_output": True,
+        "return_finish_reason": True,
+        "return_num_output_tokens": True,
+        "sampling_parameters": json.dumps(sampling),
+    }
+
+    url = f"{TRITON_BASE}/v2/models/{TRITON_MODEL}/generate"
+    t0 = time.time()
+    r = requests.post(url, json=payload, timeout=300)
+    dt = time.time() - t0
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail={"triton_status": r.status_code, "triton_body": r.text})
+
+    data = r.json()
+    raw = data.get("text_output", "") or ""
+    text = clean_output(raw)
+
+    return {
+        "id": f"chatcmpl-adapter-{int(time.time()*1000)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": req.model or TRITON_MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+            "triton_latency_s": dt,
+        },
+    }
