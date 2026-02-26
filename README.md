@@ -88,7 +88,8 @@ docker run --rm --name triton-vllm-serve \
   -v /home/rteixeira/Documents/triton/vllm_backend/samples/model_repository:/models:ro \
   triton-vllm-gptoss:25.08-hotfix5 \
   tritonserver --model-repository=/models
-
+```
+  
 
 2) OpenAI adapter (FastAPI → Triton)
 ```
